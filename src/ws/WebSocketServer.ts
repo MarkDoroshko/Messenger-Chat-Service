@@ -2,9 +2,9 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { clearInterval } from 'node:timers'
 import { IncomingMessage, Server as HttpServer } from 'node:http'
 import { v4 as uuid } from 'uuid'
-import { getPresence, refreshOnline, setOffline, setOnline } from '../redis/RedisClient'
 import { saveMessage } from '../db/messages'
-import { cleanupSession, getWatchersOf, subscribe, unsubscribe } from '../presence/Subscriptions'
+import { addContact, hasContact } from '../db/contacts'
+import { fetchUser } from '../users/UserClient'
 
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET ?? ''
 const INSTANCE_ID = process.env.INSTANCE_ID ?? `chat-${Math.random().toString(36).slice(2, 8)}`
@@ -38,19 +38,18 @@ function deliverLocal(userId: string, payload: object) {
     return delivered
 }
 
-async function broadcastPresence(userId: string) {
-    const observers = getWatchersOf(userId)
-    if (!observers || observers.size === 0) return
-    const presence = await getPresence(userId)
-    const data = JSON.stringify({
-        type: 'presence',
-        userId,
-        status: presence.status,
-        lastSeen: presence.lastSeen,
-        instanceId: presence.instanceId,
-    })
-    for (const ws of observers) {
-        if (ws.readyState === ws.OPEN) ws.send(data)
+/**
+ * Если у получателя ещё нет отправителя в контактах — добавляем (Telegram-like UX).
+ * Любая ошибка тут не должна валить доставку.
+ */
+async function ensureContactForRecipient(ownerId: string, peerId: string) {
+    try {
+        const exists = await hasContact(ownerId, peerId)
+        if (exists) return
+        const user = await fetchUser(peerId)
+        await addContact(ownerId, peerId, user.displayName)
+    } catch (err) {
+        console.warn('[chat-service] auto-add contact failed:', err)
     }
 }
 
@@ -68,7 +67,7 @@ export function attachWebSocket(server: HttpServer) {
     }
     console.log(`[chat-service] WebSocket attached, instance=${INSTANCE_ID}`)
 
-    wss.on('connection', async (ws, request) => {
+    wss.on('connection', (ws, request) => {
         const gatewaySecret = request.headers['x-gateway-secret']
         const userIdHeader = request.headers['x-user-id']
 
@@ -84,6 +83,7 @@ export function attachWebSocket(server: HttpServer) {
         }
         const userId = userIdHeader
 
+        // keepalive ping/pong (только для здоровья соединения, никаких статусов)
         let isAlive = true
         const pingInterval = setInterval(() => {
             if (!isAlive) {
@@ -94,14 +94,8 @@ export function attachWebSocket(server: HttpServer) {
             try { ws.ping() } catch {}
         }, 30_000)
 
-        try {
-            await setOnline(userId, INSTANCE_ID)
-            addConn(userId, ws)
-            console.log(`[chat-service] user ${userId} online`)
-            broadcastPresence(userId).catch(() => {})
-        } catch (err) {
-            console.error('Failed to set online:', err)
-        }
+        addConn(userId, ws)
+        console.log(`[chat-service] user ${userId} connected`)
 
         ws.on('message', async (raw) => {
             let parsed: any
@@ -109,29 +103,6 @@ export function attachWebSocket(server: HttpServer) {
                 parsed = JSON.parse(raw.toString())
             } catch {
                 ws.send(JSON.stringify({ type: 'error', error: 'invalid_json' }))
-                return
-            }
-
-            // ─── Presence subscription ───
-            if (parsed?.type === 'subscribe_presence' && Array.isArray(parsed.userIds)) {
-                const ids = parsed.userIds.filter((x: any) => typeof x === 'string')
-                const added = subscribe(ws, ids)
-                // моментально шлём текущий статус каждому добавленному id
-                await Promise.all(added.map(async (id) => {
-                    const p = await getPresence(id)
-                    ws.send(JSON.stringify({
-                        type: 'presence',
-                        userId: id,
-                        status: p.status,
-                        lastSeen: p.lastSeen,
-                        instanceId: p.instanceId,
-                    }))
-                }))
-                return
-            }
-
-            if (parsed?.type === 'unsubscribe_presence' && Array.isArray(parsed.userIds)) {
-                unsubscribe(ws, parsed.userIds.filter((x: any) => typeof x === 'string'))
                 return
             }
 
@@ -160,6 +131,9 @@ export function attachWebSocket(server: HttpServer) {
                     accepted: true,
                 }))
 
+                // Авто-добавление: получатель должен видеть отправителя в контактах
+                ensureContactForRecipient(saved.to, saved.from)
+
                 deliverLocal(saved.to, {
                     type: 'message',
                     id: saved.id,
@@ -179,24 +153,14 @@ export function attachWebSocket(server: HttpServer) {
             }
         })
 
-        ws.on('close', async () => {
+        ws.on('close', () => {
             clearInterval(pingInterval)
             removeConn(userId, ws)
-            cleanupSession(ws)
-            try {
-                if (!userConnections.has(userId)) {
-                    await setOffline(userId)
-                    console.log(`[chat-service] user ${userId} offline`)
-                    broadcastPresence(userId).catch(() => {})
-                }
-            } catch (err) {
-                console.error('Failed to set offline:', err)
-            }
+            console.log(`[chat-service] user ${userId} disconnected`)
         })
 
-        ws.on('pong', async () => {
+        ws.on('pong', () => {
             isAlive = true
-            try { await refreshOnline(userId) } catch {}
         })
     })
 }

@@ -30,6 +30,14 @@ export async function addContact(ownerId: string, peerId: string, displayName: s
     return r.rows[0] ?? null
 }
 
+export async function hasContact(ownerId: string, peerId: string): Promise<boolean> {
+    const r = await pool.query(
+        `SELECT 1 FROM contacts WHERE owner_user_id = $1 AND contact_user_id = $2`,
+        [ownerId, peerId]
+    )
+    return r.rows.length > 0
+}
+
 export async function deleteContact(ownerId: string, peerId: string): Promise<boolean> {
     const r = await pool.query(
         `DELETE FROM contacts WHERE owner_user_id = $1 AND contact_user_id = $2`,

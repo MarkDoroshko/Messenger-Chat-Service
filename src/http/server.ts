@@ -1,6 +1,5 @@
 import Fastify from 'fastify'
 import { getHistory } from '../db/messages'
-import { getPresence, getPresenceBatch } from '../redis/RedisClient'
 import { addContact, deleteContact, listContactsWithLastMessage } from '../db/contacts'
 import { fetchUser } from '../users/UserClient'
 
@@ -16,28 +15,6 @@ function requireUserId(request: any, reply: any): string | null {
 }
 
 fastify.get('/health', async () => ({ status: 'ok' }))
-
-fastify.get<{ Params: { userId: string } }>(
-    '/presence/:userId',
-    async (request) => {
-        const p = await getPresence(request.params.userId)
-        return { userId: request.params.userId, ...p }
-    }
-)
-
-fastify.post<{ Body: { userIds: string[] } }>(
-    '/presence/batch',
-    {
-        schema: {
-            body: {
-                type: 'object',
-                required: ['userIds'],
-                properties: { userIds: { type: 'array', items: { type: 'string' } } },
-            },
-        },
-    },
-    async (request) => getPresenceBatch(request.body.userIds)
-)
 
 fastify.get<{ Params: { peerId: string }; Querystring: { limit?: string } }>(
     '/messages/with/:peerId',
@@ -59,16 +36,12 @@ fastify.get('/contacts', async (request, reply) => {
     if (!userId) return
 
     const contacts = await listContactsWithLastMessage(userId)
-    const peerIds = contacts.map(c => c.peerId)
-    const presences = peerIds.length === 0 ? {} : await getPresenceBatch(peerIds)
-
     return {
         items: contacts.map(c => ({
             peerId: c.peerId,
             displayName: c.displayName,
             createdAt: c.createdAt,
             lastMessage: c.lastMessage,
-            presence: presences[c.peerId] ?? { status: 'offline', lastSeen: null, instanceId: null },
         })),
     }
 })
