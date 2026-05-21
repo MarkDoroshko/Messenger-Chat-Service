@@ -1,9 +1,11 @@
 import { initSchema } from './db/messages'
+import { initContactsSchema } from './db/contacts'
 import { fastify } from './http/server'
 import { attachWebSocket } from './ws/WebSocketServer'
 
 async function main() {
     await initSchema()
+    await initContactsSchema()
     console.log('[chat-service] schema ready')
 
     const port = Number(process.env.PORT ?? 8080)

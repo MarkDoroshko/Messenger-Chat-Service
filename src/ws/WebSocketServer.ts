@@ -2,8 +2,9 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { clearInterval } from 'node:timers'
 import { IncomingMessage, Server as HttpServer } from 'node:http'
 import { v4 as uuid } from 'uuid'
-import { refreshOnline, setOffline, setOnline } from '../redis/RedisClient'
+import { getPresence, refreshOnline, setOffline, setOnline } from '../redis/RedisClient'
 import { saveMessage } from '../db/messages'
+import { cleanupSession, getWatchersOf, subscribe, unsubscribe } from '../presence/Subscriptions'
 
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET ?? ''
 const INSTANCE_ID = process.env.INSTANCE_ID ?? `chat-${Math.random().toString(36).slice(2, 8)}`
@@ -35,6 +36,22 @@ function deliverLocal(userId: string, payload: object) {
         }
     }
     return delivered
+}
+
+async function broadcastPresence(userId: string) {
+    const observers = getWatchersOf(userId)
+    if (!observers || observers.size === 0) return
+    const presence = await getPresence(userId)
+    const data = JSON.stringify({
+        type: 'presence',
+        userId,
+        status: presence.status,
+        lastSeen: presence.lastSeen,
+        instanceId: presence.instanceId,
+    })
+    for (const ws of observers) {
+        if (ws.readyState === ws.OPEN) ws.send(data)
+    }
 }
 
 export function attachWebSocket(server: HttpServer) {
@@ -81,6 +98,7 @@ export function attachWebSocket(server: HttpServer) {
             await setOnline(userId, INSTANCE_ID)
             addConn(userId, ws)
             console.log(`[chat-service] user ${userId} online`)
+            broadcastPresence(userId).catch(() => {})
         } catch (err) {
             console.error('Failed to set online:', err)
         }
@@ -91,6 +109,29 @@ export function attachWebSocket(server: HttpServer) {
                 parsed = JSON.parse(raw.toString())
             } catch {
                 ws.send(JSON.stringify({ type: 'error', error: 'invalid_json' }))
+                return
+            }
+
+            // ─── Presence subscription ───
+            if (parsed?.type === 'subscribe_presence' && Array.isArray(parsed.userIds)) {
+                const ids = parsed.userIds.filter((x: any) => typeof x === 'string')
+                const added = subscribe(ws, ids)
+                // моментально шлём текущий статус каждому добавленному id
+                await Promise.all(added.map(async (id) => {
+                    const p = await getPresence(id)
+                    ws.send(JSON.stringify({
+                        type: 'presence',
+                        userId: id,
+                        status: p.status,
+                        lastSeen: p.lastSeen,
+                        instanceId: p.instanceId,
+                    }))
+                }))
+                return
+            }
+
+            if (parsed?.type === 'unsubscribe_presence' && Array.isArray(parsed.userIds)) {
+                unsubscribe(ws, parsed.userIds.filter((x: any) => typeof x === 'string'))
                 return
             }
 
@@ -112,7 +153,6 @@ export function attachWebSocket(server: HttpServer) {
                     content: parsed.content,
                 })
 
-                // отправляем подтверждение отправителю
                 ws.send(JSON.stringify({
                     type: 'ack',
                     clientMessageId: parsed.clientMessageId,
@@ -120,7 +160,6 @@ export function attachWebSocket(server: HttpServer) {
                     accepted: true,
                 }))
 
-                // пытаемся доставить получателю на этом инстансе
                 deliverLocal(saved.to, {
                     type: 'message',
                     id: saved.id,
@@ -129,7 +168,6 @@ export function attachWebSocket(server: HttpServer) {
                     content: saved.content,
                     createdAt: saved.createdAt,
                 })
-                // если не доставили — сообщение всё равно лежит в БД, получатель заберёт через /messages/with/
             } catch (err) {
                 console.error('[chat-service] handle message failed:', err)
                 ws.send(JSON.stringify({
@@ -144,10 +182,12 @@ export function attachWebSocket(server: HttpServer) {
         ws.on('close', async () => {
             clearInterval(pingInterval)
             removeConn(userId, ws)
+            cleanupSession(ws)
             try {
                 if (!userConnections.has(userId)) {
                     await setOffline(userId)
                     console.log(`[chat-service] user ${userId} offline`)
+                    broadcastPresence(userId).catch(() => {})
                 }
             } catch (err) {
                 console.error('Failed to set offline:', err)
