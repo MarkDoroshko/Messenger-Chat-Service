@@ -18,20 +18,41 @@ export async function initSchema() {
             status VARCHAR(20) NOT NULL DEFAULT 'sent',
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+        ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ NULL;
+        ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;
         CREATE INDEX IF NOT EXISTS idx_messages_pair_ts
             ON messages(from_user, to_user, created_at);
         CREATE INDEX IF NOT EXISTS idx_messages_to_ts
             ON messages(to_user, created_at);
+        CREATE INDEX IF NOT EXISTS idx_messages_unread
+            ON messages(to_user, from_user) WHERE status = 'sent' AND deleted_at IS NULL;
     `)
 }
+
+export type MessageStatus = 'sent' | 'delivered' | 'read'
 
 export interface SavedMessage {
     id: string
     from: string
     to: string
     content: string
-    status: 'sent' | 'delivered' | 'read'
+    status: MessageStatus
     createdAt: string
+    editedAt: string | null
+    deleted: boolean
+}
+
+function rowToMessage(row: any): SavedMessage {
+    return {
+        id: row.id,
+        from: row.from_user,
+        to: row.to_user,
+        content: row.deleted_at != null ? '' : row.content,
+        status: row.status,
+        createdAt: row.created_at.toISOString(),
+        editedAt: row.edited_at ? row.edited_at.toISOString() : null,
+        deleted: row.deleted_at != null,
+    }
 }
 
 export async function saveMessage(m: {
@@ -43,18 +64,15 @@ export async function saveMessage(m: {
     const r = await pool.query(
         `INSERT INTO messages (id, from_user, to_user, content)
          VALUES ($1, $2, $3, $4)
-         RETURNING id, from_user, to_user, content, status, created_at`,
+         RETURNING *`,
         [m.id, m.from, m.to, m.content]
     )
-    const row = r.rows[0]
-    return {
-        id: row.id,
-        from: row.from_user,
-        to: row.to_user,
-        content: row.content,
-        status: row.status,
-        createdAt: row.created_at.toISOString(),
-    }
+    return rowToMessage(r.rows[0])
+}
+
+export async function getMessage(id: string): Promise<SavedMessage | null> {
+    const r = await pool.query(`SELECT * FROM messages WHERE id = $1`, [id])
+    return r.rows[0] ? rowToMessage(r.rows[0]) : null
 }
 
 export async function getHistory(
@@ -63,7 +81,7 @@ export async function getHistory(
     limit = 50
 ): Promise<SavedMessage[]> {
     const r = await pool.query(
-        `SELECT id, from_user, to_user, content, status, created_at
+        `SELECT *
          FROM messages
          WHERE (from_user = $1 AND to_user = $2)
             OR (from_user = $2 AND to_user = $1)
@@ -71,12 +89,49 @@ export async function getHistory(
          LIMIT $3`,
         [userA, userB, limit]
     )
-    return r.rows.map((row: any) => ({
-        id: row.id,
-        from: row.from_user,
-        to: row.to_user,
-        content: row.content,
-        status: row.status,
-        createdAt: row.created_at.toISOString(),
-    }))
+    return r.rows.map(rowToMessage)
+}
+
+/**
+ * Помечаем все непрочитанные от peer→me как 'read'. Возвращаем счётчик.
+ */
+export async function markAllRead(me: string, peerId: string): Promise<number> {
+    const r = await pool.query(
+        `UPDATE messages
+         SET status = 'read'
+         WHERE to_user = $1 AND from_user = $2 AND status <> 'read' AND deleted_at IS NULL`,
+        [me, peerId]
+    )
+    return r.rowCount ?? 0
+}
+
+/**
+ * Редактирование. Только владелец (from_user). Не редактируем удалённое.
+ * Возвращаем обновлённое сообщение или null если нельзя.
+ */
+export async function editMessage(
+    id: string,
+    ownerId: string,
+    newContent: string
+): Promise<SavedMessage | null> {
+    const r = await pool.query(
+        `UPDATE messages
+         SET content = $3, edited_at = NOW()
+         WHERE id = $1 AND from_user = $2 AND deleted_at IS NULL
+         RETURNING *`,
+        [id, ownerId, newContent]
+    )
+    return r.rows[0] ? rowToMessage(r.rows[0]) : null
+}
+
+/** Soft-delete. Только владелец. */
+export async function deleteMessage(id: string, ownerId: string): Promise<SavedMessage | null> {
+    const r = await pool.query(
+        `UPDATE messages
+         SET deleted_at = NOW(), content = ''
+         WHERE id = $1 AND from_user = $2 AND deleted_at IS NULL
+         RETURNING *`,
+        [id, ownerId]
+    )
+    return r.rows[0] ? rowToMessage(r.rows[0]) : null
 }

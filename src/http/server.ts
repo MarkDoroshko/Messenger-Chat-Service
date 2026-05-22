@@ -1,6 +1,6 @@
 import Fastify from 'fastify'
 import { getHistory } from '../db/messages'
-import { addContact, deleteContact, listContactsWithLastMessage } from '../db/contacts'
+import { addContact, deleteContact, listContactsWithMeta } from '../db/contacts'
 import { fetchUser } from '../users/UserClient'
 
 export const fastify = Fastify({ logger: true })
@@ -35,13 +35,14 @@ fastify.get('/contacts', async (request, reply) => {
     const userId = requireUserId(request, reply)
     if (!userId) return
 
-    const contacts = await listContactsWithLastMessage(userId)
+    const contacts = await listContactsWithMeta(userId)
     return {
         items: contacts.map(c => ({
             peerId: c.peerId,
             displayName: c.displayName,
             createdAt: c.createdAt,
             lastMessage: c.lastMessage,
+            unreadCount: c.unreadCount,
         })),
     }
 })

@@ -13,12 +13,6 @@ export async function initContactsSchema() {
     `)
 }
 
-export interface ContactRow {
-    peerId: string
-    displayName: string
-    createdAt: string
-}
-
 export async function addContact(ownerId: string, peerId: string, displayName: string) {
     const r = await pool.query(
         `INSERT INTO contacts (owner_user_id, contact_user_id, display_name)
@@ -46,7 +40,7 @@ export async function deleteContact(ownerId: string, peerId: string): Promise<bo
     return (r.rowCount ?? 0) > 0
 }
 
-export interface ContactWithMessage {
+export interface ContactWithMeta {
     peerId: string
     displayName: string
     createdAt: string
@@ -54,10 +48,12 @@ export interface ContactWithMessage {
         content: string
         createdAt: string
         fromMe: boolean
+        deleted: boolean
     } | null
+    unreadCount: number
 }
 
-export async function listContactsWithLastMessage(ownerId: string): Promise<ContactWithMessage[]> {
+export async function listContactsWithMeta(ownerId: string): Promise<ContactWithMeta[]> {
     const r = await pool.query(
         `
         SELECT
@@ -66,16 +62,26 @@ export async function listContactsWithLastMessage(ownerId: string): Promise<Cont
           c.created_at,
           m.content AS last_content,
           m.from_user AS last_from,
-          m.created_at AS last_created
+          m.created_at AS last_created,
+          m.deleted_at AS last_deleted_at,
+          COALESCE(u.cnt, 0)::int AS unread_count
         FROM contacts c
         LEFT JOIN LATERAL (
-          SELECT content, from_user, created_at
+          SELECT content, from_user, created_at, deleted_at
           FROM messages
           WHERE (from_user = c.owner_user_id AND to_user = c.contact_user_id)
              OR (from_user = c.contact_user_id AND to_user = c.owner_user_id)
           ORDER BY created_at DESC
           LIMIT 1
         ) m ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*) AS cnt
+          FROM messages
+          WHERE from_user = c.contact_user_id
+            AND to_user = c.owner_user_id
+            AND status <> 'read'
+            AND deleted_at IS NULL
+        ) u ON TRUE
         WHERE c.owner_user_id = $1
         ORDER BY m.created_at DESC NULLS LAST, c.created_at DESC
         `,
@@ -85,12 +91,14 @@ export async function listContactsWithLastMessage(ownerId: string): Promise<Cont
         peerId: row.peer_id,
         displayName: row.display_name,
         createdAt: row.created_at.toISOString(),
-        lastMessage: row.last_content == null
+        lastMessage: row.last_created == null
             ? null
             : {
-                content: row.last_content,
+                content: row.last_deleted_at != null ? '' : (row.last_content ?? ''),
                 createdAt: row.last_created.toISOString(),
                 fromMe: row.last_from === ownerId,
+                deleted: row.last_deleted_at != null,
             },
+        unreadCount: row.unread_count,
     }))
 }

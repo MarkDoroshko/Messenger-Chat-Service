@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { clearInterval } from 'node:timers'
 import { IncomingMessage, Server as HttpServer } from 'node:http'
 import { v4 as uuid } from 'uuid'
-import { saveMessage } from '../db/messages'
+import { deleteMessage, editMessage, getMessage, markAllRead, saveMessage } from '../db/messages'
 import { addContact, hasContact } from '../db/contacts'
 import { fetchUser } from '../users/UserClient'
 
@@ -28,24 +28,15 @@ function deliverLocal(userId: string, payload: object) {
     const set = userConnections.get(userId)
     if (!set || set.size === 0) return false
     const data = JSON.stringify(payload)
-    let delivered = false
     for (const ws of set) {
-        if (ws.readyState === ws.OPEN) {
-            ws.send(data)
-            delivered = true
-        }
+        if (ws.readyState === ws.OPEN) ws.send(data)
     }
-    return delivered
+    return true
 }
 
-/**
- * Если у получателя ещё нет отправителя в контактах — добавляем (Telegram-like UX).
- * Любая ошибка тут не должна валить доставку.
- */
 async function ensureContactForRecipient(ownerId: string, peerId: string) {
     try {
-        const exists = await hasContact(ownerId, peerId)
-        if (exists) return
+        if (await hasContact(ownerId, peerId)) return
         const user = await fetchUser(peerId)
         await addContact(ownerId, peerId, user.displayName)
     } catch (err) {
@@ -63,7 +54,7 @@ export function attachWebSocket(server: HttpServer) {
     })
 
     if (!GATEWAY_SECRET) {
-        console.warn('[chat-service] WARNING: GATEWAY_SECRET is empty — connections will be rejected')
+        console.warn('[chat-service] WARNING: GATEWAY_SECRET is empty')
     }
     console.log(`[chat-service] WebSocket attached, instance=${INSTANCE_ID}`)
 
@@ -72,24 +63,16 @@ export function attachWebSocket(server: HttpServer) {
         const userIdHeader = request.headers['x-user-id']
 
         if (!GATEWAY_SECRET || gatewaySecret !== GATEWAY_SECRET) {
-            console.warn('[chat-service] rejected: bad X-Gateway-Secret')
-            ws.close(4401, 'unauthorized')
-            return
+            ws.close(4401, 'unauthorized'); return
         }
         if (!userIdHeader || Array.isArray(userIdHeader)) {
-            console.warn('[chat-service] rejected: missing X-User-Id')
-            ws.close(4400, 'no user id')
-            return
+            ws.close(4400, 'no user id'); return
         }
         const userId = userIdHeader
 
-        // keepalive ping/pong (только для здоровья соединения, никаких статусов)
         let isAlive = true
         const pingInterval = setInterval(() => {
-            if (!isAlive) {
-                ws.terminate()
-                return
-            }
+            if (!isAlive) { ws.terminate(); return }
             isAlive = false
             try { ws.ping() } catch {}
         }, 30_000)
@@ -99,57 +82,38 @@ export function attachWebSocket(server: HttpServer) {
 
         ws.on('message', async (raw) => {
             let parsed: any
-            try {
-                parsed = JSON.parse(raw.toString())
-            } catch {
-                ws.send(JSON.stringify({ type: 'error', error: 'invalid_json' }))
-                return
-            }
-
-            if (parsed?.type === 'ping') {
-                ws.send(JSON.stringify({ type: 'pong' }))
-                return
-            }
-
-            if (parsed?.type !== 'message' || typeof parsed.to !== 'string' || typeof parsed.content !== 'string') {
-                ws.send(JSON.stringify({ type: 'error', error: 'unknown_type' }))
-                return
+            try { parsed = JSON.parse(raw.toString()) } catch {
+                ws.send(JSON.stringify({ type: 'error', error: 'invalid_json' })); return
             }
 
             try {
-                const saved = await saveMessage({
-                    id: uuid(),
-                    from: userId,
-                    to: parsed.to,
-                    content: parsed.content,
-                })
+                switch (parsed?.type) {
+                    case 'ping':
+                        ws.send(JSON.stringify({ type: 'pong' }))
+                        return
 
-                ws.send(JSON.stringify({
-                    type: 'ack',
-                    clientMessageId: parsed.clientMessageId,
-                    id: saved.id,
-                    accepted: true,
-                }))
+                    case 'message':
+                        await handleSendMessage(ws, userId, parsed)
+                        return
 
-                // Авто-добавление: получатель должен видеть отправителя в контактах
-                ensureContactForRecipient(saved.to, saved.from)
+                    case 'mark_read':
+                        await handleMarkRead(userId, parsed)
+                        return
 
-                deliverLocal(saved.to, {
-                    type: 'message',
-                    id: saved.id,
-                    from: saved.from,
-                    to: saved.to,
-                    content: saved.content,
-                    createdAt: saved.createdAt,
-                })
+                    case 'edit_message':
+                        await handleEditMessage(ws, userId, parsed)
+                        return
+
+                    case 'delete_message':
+                        await handleDeleteMessage(ws, userId, parsed)
+                        return
+
+                    default:
+                        ws.send(JSON.stringify({ type: 'error', error: 'unknown_type' }))
+                }
             } catch (err) {
-                console.error('[chat-service] handle message failed:', err)
-                ws.send(JSON.stringify({
-                    type: 'ack',
-                    clientMessageId: parsed.clientMessageId,
-                    accepted: false,
-                    error: 'server_error',
-                }))
+                console.error('[chat-service] WS handler error:', err)
+                ws.send(JSON.stringify({ type: 'error', error: 'server_error' }))
             }
         })
 
@@ -159,8 +123,124 @@ export function attachWebSocket(server: HttpServer) {
             console.log(`[chat-service] user ${userId} disconnected`)
         })
 
-        ws.on('pong', () => {
-            isAlive = true
-        })
+        ws.on('pong', () => { isAlive = true })
     })
+}
+
+// ───────────── handlers ─────────────
+
+async function handleSendMessage(ws: WebSocket, userId: string, parsed: any) {
+    if (typeof parsed.to !== 'string' || typeof parsed.content !== 'string') {
+        ws.send(JSON.stringify({ type: 'error', error: 'bad_message_payload' })); return
+    }
+    const content = parsed.content.trim()
+    if (content.length === 0) {
+        ws.send(JSON.stringify({ type: 'error', error: 'empty_content' })); return
+    }
+
+    const saved = await saveMessage({
+        id: uuid(), from: userId, to: parsed.to, content,
+    })
+
+    ws.send(JSON.stringify({
+        type: 'ack',
+        clientMessageId: parsed.clientMessageId,
+        id: saved.id,
+        accepted: true,
+    }))
+
+    ensureContactForRecipient(saved.to, saved.from)
+
+    deliverLocal(saved.to, msgPayload(saved))
+}
+
+async function handleMarkRead(userId: string, parsed: any) {
+    if (typeof parsed.peerId !== 'string') return
+    const updated = await markAllRead(userId, parsed.peerId)
+    if (updated > 0) {
+        // уведомляем отправителя: все его сообщения этому юзеру прочитаны
+        deliverLocal(parsed.peerId, {
+            type: 'messages_read',
+            byUserId: userId,
+        })
+    }
+}
+
+async function handleEditMessage(ws: WebSocket, userId: string, parsed: any) {
+    if (typeof parsed.id !== 'string' || typeof parsed.content !== 'string') {
+        ws.send(JSON.stringify({ type: 'error', error: 'bad_edit_payload' })); return
+    }
+    const content = parsed.content.trim()
+    if (content.length === 0) {
+        ws.send(JSON.stringify({ type: 'error', error: 'empty_content' })); return
+    }
+
+    const existing = await getMessage(parsed.id)
+    if (!existing) {
+        ws.send(JSON.stringify({ type: 'error', error: 'not_found' })); return
+    }
+    if (existing.from !== userId) {
+        ws.send(JSON.stringify({ type: 'error', error: 'forbidden' })); return
+    }
+    if (existing.deleted) {
+        ws.send(JSON.stringify({ type: 'error', error: 'deleted' })); return
+    }
+
+    const updated = await editMessage(parsed.id, userId, content)
+    if (!updated) {
+        ws.send(JSON.stringify({ type: 'error', error: 'edit_failed' })); return
+    }
+
+    const event = {
+        type: 'message_edited',
+        id: updated.id,
+        from: updated.from,
+        to: updated.to,
+        content: updated.content,
+        editedAt: updated.editedAt,
+    }
+    deliverLocal(updated.from, event)
+    deliverLocal(updated.to, event)
+}
+
+async function handleDeleteMessage(ws: WebSocket, userId: string, parsed: any) {
+    if (typeof parsed.id !== 'string') {
+        ws.send(JSON.stringify({ type: 'error', error: 'bad_delete_payload' })); return
+    }
+
+    const existing = await getMessage(parsed.id)
+    if (!existing) {
+        ws.send(JSON.stringify({ type: 'error', error: 'not_found' })); return
+    }
+    if (existing.from !== userId) {
+        ws.send(JSON.stringify({ type: 'error', error: 'forbidden' })); return
+    }
+
+    const updated = await deleteMessage(parsed.id, userId)
+    if (!updated) {
+        ws.send(JSON.stringify({ type: 'error', error: 'delete_failed' })); return
+    }
+
+    const event = {
+        type: 'message_deleted',
+        id: updated.id,
+        from: updated.from,
+        to: updated.to,
+    }
+    deliverLocal(updated.from, event)
+    deliverLocal(updated.to, event)
+}
+
+function msgPayload(saved: any) {
+    return {
+        type: 'message',
+        id: saved.id,
+        from: saved.from,
+        to: saved.to,
+        content: saved.content,
+        status: saved.status,
+        createdAt: saved.createdAt,
+        editedAt: saved.editedAt,
+        deleted: saved.deleted,
+    }
 }
