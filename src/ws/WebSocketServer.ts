@@ -2,9 +2,13 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { clearInterval } from 'node:timers'
 import { IncomingMessage, Server as HttpServer } from 'node:http'
 import { v4 as uuid } from 'uuid'
-import { deleteMessage, editMessage, getMessage, markAllRead, saveMessage } from '../db/messages'
-import { addContact, hasContact } from '../db/contacts'
-import { fetchUser } from '../users/UserClient'
+import {
+    saveMessage, getMessage, editMessage, deleteMessage, SavedMessage,
+} from '../db/messages'
+import {
+    isMember, getMemberIds, markChatRead,
+} from '../db/chats'
+import { pinMessage, unpinMessage } from '../db/pins'
 
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET ?? ''
 const INSTANCE_ID = process.env.INSTANCE_ID ?? `chat-${Math.random().toString(36).slice(2, 8)}`
@@ -16,7 +20,6 @@ function addConn(userId: string, ws: WebSocket) {
     if (!set) { set = new Set(); userConnections.set(userId, set) }
     set.add(ws)
 }
-
 function removeConn(userId: string, ws: WebSocket) {
     const set = userConnections.get(userId)
     if (!set) return
@@ -24,23 +27,31 @@ function removeConn(userId: string, ws: WebSocket) {
     if (set.size === 0) userConnections.delete(userId)
 }
 
-function deliverLocal(userId: string, payload: object) {
+function sendTo(userId: string, payload: object) {
     const set = userConnections.get(userId)
-    if (!set || set.size === 0) return false
+    if (!set) return
     const data = JSON.stringify(payload)
     for (const ws of set) {
         if (ws.readyState === ws.OPEN) ws.send(data)
     }
-    return true
 }
 
-async function ensureContactForRecipient(ownerId: string, peerId: string) {
-    try {
-        if (await hasContact(ownerId, peerId)) return
-        const user = await fetchUser(peerId)
-        await addContact(ownerId, peerId, user.displayName)
-    } catch (err) {
-        console.warn('[chat-service] auto-add contact failed:', err)
+async function broadcastToChat(chatId: string, payload: object) {
+    const members = await getMemberIds(chatId)
+    for (const uid of members) sendTo(uid, payload)
+}
+
+function msgPayload(saved: SavedMessage) {
+    return {
+        type: 'message',
+        id: saved.id,
+        chatId: saved.chatId,
+        senderId: saved.senderId,
+        content: saved.content,
+        replyToId: saved.replyToId,
+        createdAt: saved.createdAt,
+        editedAt: saved.editedAt,
+        deleted: saved.deleted,
     }
 }
 
@@ -53,15 +64,12 @@ export function attachWebSocket(server: HttpServer) {
         })
     })
 
-    if (!GATEWAY_SECRET) {
-        console.warn('[chat-service] WARNING: GATEWAY_SECRET is empty')
-    }
+    if (!GATEWAY_SECRET) console.warn('[chat-service] WARNING: GATEWAY_SECRET is empty')
     console.log(`[chat-service] WebSocket attached, instance=${INSTANCE_ID}`)
 
     wss.on('connection', (ws, request) => {
         const gatewaySecret = request.headers['x-gateway-secret']
         const userIdHeader = request.headers['x-user-id']
-
         if (!GATEWAY_SECRET || gatewaySecret !== GATEWAY_SECRET) {
             ws.close(4401, 'unauthorized'); return
         }
@@ -85,29 +93,22 @@ export function attachWebSocket(server: HttpServer) {
             try { parsed = JSON.parse(raw.toString()) } catch {
                 ws.send(JSON.stringify({ type: 'error', error: 'invalid_json' })); return
             }
-
             try {
                 switch (parsed?.type) {
                     case 'ping':
-                        ws.send(JSON.stringify({ type: 'pong' }))
-                        return
-
+                        ws.send(JSON.stringify({ type: 'pong' })); return
                     case 'message':
-                        await handleSendMessage(ws, userId, parsed)
-                        return
-
+                        await handleSendMessage(ws, userId, parsed); return
                     case 'mark_read':
-                        await handleMarkRead(userId, parsed)
-                        return
-
+                        await handleMarkRead(userId, parsed); return
                     case 'edit_message':
-                        await handleEditMessage(ws, userId, parsed)
-                        return
-
+                        await handleEditMessage(ws, userId, parsed); return
                     case 'delete_message':
-                        await handleDeleteMessage(ws, userId, parsed)
-                        return
-
+                        await handleDeleteMessage(ws, userId, parsed); return
+                    case 'pin_message':
+                        await handlePin(ws, userId, parsed); return
+                    case 'unpin_message':
+                        await handleUnpin(ws, userId, parsed); return
                     default:
                         ws.send(JSON.stringify({ type: 'error', error: 'unknown_type' }))
                 }
@@ -120,9 +121,7 @@ export function attachWebSocket(server: HttpServer) {
         ws.on('close', () => {
             clearInterval(pingInterval)
             removeConn(userId, ws)
-            console.log(`[chat-service] user ${userId} disconnected`)
         })
-
         ws.on('pong', () => { isAlive = true })
     })
 }
@@ -130,40 +129,43 @@ export function attachWebSocket(server: HttpServer) {
 // ───────────── handlers ─────────────
 
 async function handleSendMessage(ws: WebSocket, userId: string, parsed: any) {
-    if (typeof parsed.to !== 'string' || typeof parsed.content !== 'string') {
+    const chatId = parsed.chatId
+    const content = typeof parsed.content === 'string' ? parsed.content.trim() : ''
+    if (typeof chatId !== 'string' || content.length === 0) {
         ws.send(JSON.stringify({ type: 'error', error: 'bad_message_payload' })); return
     }
-    const content = parsed.content.trim()
-    if (content.length === 0) {
-        ws.send(JSON.stringify({ type: 'error', error: 'empty_content' })); return
+    if (!(await isMember(chatId, userId))) {
+        ws.send(JSON.stringify({ type: 'error', error: 'not_a_member' })); return
     }
-
+    const replyToId = typeof parsed.replyToId === 'string' ? parsed.replyToId : null
     const saved = await saveMessage({
-        id: uuid(), from: userId, to: parsed.to, content,
+        id: uuid(),
+        chatId,
+        senderId: userId,
+        content,
+        replyToId,
     })
-
     ws.send(JSON.stringify({
         type: 'ack',
         clientMessageId: parsed.clientMessageId,
         id: saved.id,
+        chatId: saved.chatId,
+        createdAt: saved.createdAt,
         accepted: true,
     }))
-
-    ensureContactForRecipient(saved.to, saved.from)
-
-    deliverLocal(saved.to, msgPayload(saved))
+    await broadcastToChat(chatId, msgPayload(saved))
 }
 
 async function handleMarkRead(userId: string, parsed: any) {
-    if (typeof parsed.peerId !== 'string') return
-    const updated = await markAllRead(userId, parsed.peerId)
-    if (updated > 0) {
-        // уведомляем отправителя: все его сообщения этому юзеру прочитаны
-        deliverLocal(parsed.peerId, {
-            type: 'messages_read',
-            byUserId: userId,
-        })
-    }
+    if (typeof parsed.chatId !== 'string') return
+    if (!(await isMember(parsed.chatId, userId))) return
+    const ts = await markChatRead(parsed.chatId, userId)
+    await broadcastToChat(parsed.chatId, {
+        type: 'messages_read',
+        chatId: parsed.chatId,
+        byUserId: userId,
+        readAt: ts,
+    })
 }
 
 async function handleEditMessage(ws: WebSocket, userId: string, parsed: any) {
@@ -174,73 +176,73 @@ async function handleEditMessage(ws: WebSocket, userId: string, parsed: any) {
     if (content.length === 0) {
         ws.send(JSON.stringify({ type: 'error', error: 'empty_content' })); return
     }
-
     const existing = await getMessage(parsed.id)
-    if (!existing) {
-        ws.send(JSON.stringify({ type: 'error', error: 'not_found' })); return
-    }
-    if (existing.from !== userId) {
-        ws.send(JSON.stringify({ type: 'error', error: 'forbidden' })); return
-    }
-    if (existing.deleted) {
-        ws.send(JSON.stringify({ type: 'error', error: 'deleted' })); return
-    }
+    if (!existing) { ws.send(JSON.stringify({ type: 'error', error: 'not_found' })); return }
+    if (existing.senderId !== userId) { ws.send(JSON.stringify({ type: 'error', error: 'forbidden' })); return }
+    if (existing.deleted) { ws.send(JSON.stringify({ type: 'error', error: 'deleted' })); return }
 
     const updated = await editMessage(parsed.id, userId, content)
-    if (!updated) {
-        ws.send(JSON.stringify({ type: 'error', error: 'edit_failed' })); return
-    }
-
-    const event = {
+    if (!updated) { ws.send(JSON.stringify({ type: 'error', error: 'edit_failed' })); return }
+    await broadcastToChat(updated.chatId, {
         type: 'message_edited',
         id: updated.id,
-        from: updated.from,
-        to: updated.to,
+        chatId: updated.chatId,
         content: updated.content,
         editedAt: updated.editedAt,
-    }
-    deliverLocal(updated.from, event)
-    deliverLocal(updated.to, event)
+    })
 }
 
 async function handleDeleteMessage(ws: WebSocket, userId: string, parsed: any) {
     if (typeof parsed.id !== 'string') {
         ws.send(JSON.stringify({ type: 'error', error: 'bad_delete_payload' })); return
     }
-
     const existing = await getMessage(parsed.id)
-    if (!existing) {
-        ws.send(JSON.stringify({ type: 'error', error: 'not_found' })); return
-    }
-    if (existing.from !== userId) {
-        ws.send(JSON.stringify({ type: 'error', error: 'forbidden' })); return
-    }
+    if (!existing) { ws.send(JSON.stringify({ type: 'error', error: 'not_found' })); return }
+    if (existing.senderId !== userId) { ws.send(JSON.stringify({ type: 'error', error: 'forbidden' })); return }
 
     const updated = await deleteMessage(parsed.id, userId)
-    if (!updated) {
-        ws.send(JSON.stringify({ type: 'error', error: 'delete_failed' })); return
-    }
-
-    const event = {
+    if (!updated) { ws.send(JSON.stringify({ type: 'error', error: 'delete_failed' })); return }
+    await broadcastToChat(updated.chatId, {
         type: 'message_deleted',
         id: updated.id,
-        from: updated.from,
-        to: updated.to,
-    }
-    deliverLocal(updated.from, event)
-    deliverLocal(updated.to, event)
+        chatId: updated.chatId,
+    })
 }
 
-function msgPayload(saved: any) {
-    return {
-        type: 'message',
-        id: saved.id,
-        from: saved.from,
-        to: saved.to,
-        content: saved.content,
-        status: saved.status,
-        createdAt: saved.createdAt,
-        editedAt: saved.editedAt,
-        deleted: saved.deleted,
+async function handlePin(ws: WebSocket, userId: string, parsed: any) {
+    if (typeof parsed.chatId !== 'string' || typeof parsed.messageId !== 'string') {
+        ws.send(JSON.stringify({ type: 'error', error: 'bad_pin_payload' })); return
     }
+    if (!(await isMember(parsed.chatId, userId))) {
+        ws.send(JSON.stringify({ type: 'error', error: 'not_a_member' })); return
+    }
+    const msg = await getMessage(parsed.messageId)
+    if (!msg || msg.chatId !== parsed.chatId) {
+        ws.send(JSON.stringify({ type: 'error', error: 'not_found' })); return
+    }
+    const pinned = await pinMessage(parsed.chatId, parsed.messageId, userId)
+    if (!pinned) return
+    await broadcastToChat(parsed.chatId, {
+        type: 'message_pinned',
+        chatId: parsed.chatId,
+        messageId: parsed.messageId,
+        pinnedBy: userId,
+        pinnedAt: pinned.pinnedAt,
+    })
+}
+
+async function handleUnpin(ws: WebSocket, userId: string, parsed: any) {
+    if (typeof parsed.chatId !== 'string' || typeof parsed.messageId !== 'string') {
+        ws.send(JSON.stringify({ type: 'error', error: 'bad_unpin_payload' })); return
+    }
+    if (!(await isMember(parsed.chatId, userId))) {
+        ws.send(JSON.stringify({ type: 'error', error: 'not_a_member' })); return
+    }
+    const ok = await unpinMessage(parsed.chatId, parsed.messageId)
+    if (!ok) return
+    await broadcastToChat(parsed.chatId, {
+        type: 'message_unpinned',
+        chatId: parsed.chatId,
+        messageId: parsed.messageId,
+    })
 }

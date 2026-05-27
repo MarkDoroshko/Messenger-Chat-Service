@@ -1,17 +1,16 @@
-import { initSchema } from './db/messages'
-import { initContactsSchema } from './db/contacts'
+import { initSchema } from './db/pool'
+import { ensureUserNamesSchema } from './db/chats'
 import { fastify } from './http/server'
 import { attachWebSocket } from './ws/WebSocketServer'
 
 async function main() {
     await initSchema()
-    await initContactsSchema()
+    await ensureUserNamesSchema()
     console.log('[chat-service] schema ready')
 
     const port = Number(process.env.PORT ?? 8080)
     await fastify.listen({ host: '0.0.0.0', port })
 
-    // ws крепится к тому же HTTP-серверу fastify — один порт на всё
     attachWebSocket(fastify.server)
 
     const shutdown = async () => {

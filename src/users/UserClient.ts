@@ -13,9 +13,6 @@ export interface UserBrief {
     bio: string | null
 }
 
-/**
- * Кидает Error с message='not_found' если пользователь не найден.
- */
 export async function fetchUser(userId: string): Promise<UserBrief> {
     const res = await fetch(`${USER_SERVICE_URL}/internal/users/${userId}`, {
         headers: { Authorization: basicAuth() },
@@ -29,4 +26,16 @@ export async function fetchUser(userId: string): Promise<UserBrief> {
         phone: body.phone ?? null,
         bio: body.bio ?? null,
     }
+}
+
+export async function fetchManyUsers(userIds: string[]): Promise<UserBrief[]> {
+    const out: UserBrief[] = []
+    for (const id of userIds) {
+        try {
+            out.push(await fetchUser(id))
+        } catch {
+            // ignore — пользователь мог быть удалён
+        }
+    }
+    return out
 }

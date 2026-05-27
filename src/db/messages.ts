@@ -1,42 +1,11 @@
-import { Pool } from 'pg'
-
-export const pool = new Pool({
-    host: process.env.POSTGRES_HOST,
-    port: Number(process.env.POSTGRES_PORT ?? 5432),
-    user: process.env.POSTGRES_USER,
-    password: process.env.POSTGRES_PASSWORD,
-    database: process.env.POSTGRES_DB,
-})
-
-export async function initSchema() {
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS messages (
-            id UUID PRIMARY KEY,
-            from_user UUID NOT NULL,
-            to_user UUID NOT NULL,
-            content TEXT NOT NULL,
-            status VARCHAR(20) NOT NULL DEFAULT 'sent',
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ NULL;
-        ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;
-        CREATE INDEX IF NOT EXISTS idx_messages_pair_ts
-            ON messages(from_user, to_user, created_at);
-        CREATE INDEX IF NOT EXISTS idx_messages_to_ts
-            ON messages(to_user, created_at);
-        CREATE INDEX IF NOT EXISTS idx_messages_unread
-            ON messages(to_user, from_user) WHERE status = 'sent' AND deleted_at IS NULL;
-    `)
-}
-
-export type MessageStatus = 'sent' | 'delivered' | 'read'
+import { pool } from './pool'
 
 export interface SavedMessage {
     id: string
-    from: string
-    to: string
+    chatId: string
+    senderId: string
     content: string
-    status: MessageStatus
+    replyToId: string | null
     createdAt: string
     editedAt: string | null
     deleted: boolean
@@ -45,10 +14,10 @@ export interface SavedMessage {
 function rowToMessage(row: any): SavedMessage {
     return {
         id: row.id,
-        from: row.from_user,
-        to: row.to_user,
+        chatId: row.chat_id,
+        senderId: row.sender_id,
         content: row.deleted_at != null ? '' : row.content,
-        status: row.status,
+        replyToId: row.reply_to_id ?? null,
         createdAt: row.created_at.toISOString(),
         editedAt: row.edited_at ? row.edited_at.toISOString() : null,
         deleted: row.deleted_at != null,
@@ -57,15 +26,16 @@ function rowToMessage(row: any): SavedMessage {
 
 export async function saveMessage(m: {
     id: string
-    from: string
-    to: string
+    chatId: string
+    senderId: string
     content: string
+    replyToId?: string | null
 }): Promise<SavedMessage> {
     const r = await pool.query(
-        `INSERT INTO messages (id, from_user, to_user, content)
-         VALUES ($1, $2, $3, $4)
+        `INSERT INTO messages (id, chat_id, sender_id, content, reply_to_id)
+         VALUES ($1, $2, $3, $4, $5)
          RETURNING *`,
-        [m.id, m.from, m.to, m.content]
+        [m.id, m.chatId, m.senderId, m.content, m.replyToId ?? null]
     )
     return rowToMessage(r.rows[0])
 }
@@ -75,40 +45,29 @@ export async function getMessage(id: string): Promise<SavedMessage | null> {
     return r.rows[0] ? rowToMessage(r.rows[0]) : null
 }
 
-export async function getHistory(
-    userA: string,
-    userB: string,
-    limit = 50
-): Promise<SavedMessage[]> {
+export async function getHistory(chatId: string, limit = 100): Promise<SavedMessage[]> {
     const r = await pool.query(
-        `SELECT *
-         FROM messages
-         WHERE (from_user = $1 AND to_user = $2)
-            OR (from_user = $2 AND to_user = $1)
-         ORDER BY created_at DESC
-         LIMIT $3`,
-        [userA, userB, limit]
+        `SELECT * FROM messages
+         WHERE chat_id = $1
+         ORDER BY created_at ASC
+         LIMIT $2`,
+        [chatId, limit]
     )
     return r.rows.map(rowToMessage)
 }
 
-/**
- * Помечаем все непрочитанные от peer→me как 'read'. Возвращаем счётчик.
- */
-export async function markAllRead(me: string, peerId: string): Promise<number> {
+export async function searchMessages(chatId: string, query: string): Promise<SavedMessage[]> {
+    const q = `%${query.replace(/[%_]/g, ch => '\\' + ch)}%`
     const r = await pool.query(
-        `UPDATE messages
-         SET status = 'read'
-         WHERE to_user = $1 AND from_user = $2 AND status <> 'read' AND deleted_at IS NULL`,
-        [me, peerId]
+        `SELECT * FROM messages
+         WHERE chat_id = $1 AND deleted_at IS NULL AND content ILIKE $2
+         ORDER BY created_at ASC
+         LIMIT 200`,
+        [chatId, q]
     )
-    return r.rowCount ?? 0
+    return r.rows.map(rowToMessage)
 }
 
-/**
- * Редактирование. Только владелец (from_user). Не редактируем удалённое.
- * Возвращаем обновлённое сообщение или null если нельзя.
- */
 export async function editMessage(
     id: string,
     ownerId: string,
@@ -117,21 +76,40 @@ export async function editMessage(
     const r = await pool.query(
         `UPDATE messages
          SET content = $3, edited_at = NOW()
-         WHERE id = $1 AND from_user = $2 AND deleted_at IS NULL
+         WHERE id = $1 AND sender_id = $2 AND deleted_at IS NULL
          RETURNING *`,
         [id, ownerId, newContent]
     )
     return r.rows[0] ? rowToMessage(r.rows[0]) : null
 }
 
-/** Soft-delete. Только владелец. */
 export async function deleteMessage(id: string, ownerId: string): Promise<SavedMessage | null> {
     const r = await pool.query(
         `UPDATE messages
          SET deleted_at = NOW(), content = ''
-         WHERE id = $1 AND from_user = $2 AND deleted_at IS NULL
+         WHERE id = $1 AND sender_id = $2 AND deleted_at IS NULL
          RETURNING *`,
         [id, ownerId]
     )
     return r.rows[0] ? rowToMessage(r.rows[0]) : null
+}
+
+/**
+ * Возвращает список user_id участников чата (кроме отправителя),
+ * чьи last_read_at >= созданного сообщения.
+ */
+export async function getReadersOfMessage(messageId: string): Promise<{ userId: string, readAt: string }[]> {
+    const r = await pool.query(
+        `SELECT cm.user_id, cm.last_read_at
+         FROM messages m
+         JOIN chat_members cm ON cm.chat_id = m.chat_id
+         WHERE m.id = $1
+           AND cm.user_id <> m.sender_id
+           AND cm.last_read_at >= m.created_at`,
+        [messageId]
+    )
+    return r.rows.map(row => ({
+        userId: row.user_id,
+        readAt: row.last_read_at.toISOString(),
+    }))
 }
